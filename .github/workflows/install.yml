@@ -1,0 +1,148 @@
+name: install
+
+# Runs the real installer on a clean Ubuntu 24.04 machine, then the check
+# anyone runs afterwards. These scripts only break on a real machine.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly: the workspace clone tracks upstream's jazzy branch, so upstream can
+  # break the install without anything here changing.
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native:
+    name: native install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax
+        run: |
+          bash -n install.sh
+          bash -n env_check.sh
+          bash -n pins.env
+
+      - name: Strip the runner's non-archive toolchain
+        # The GitHub image carries its own CMake in /usr/local, ahead of the
+        # archive on PATH, so the runner would fail a pin that is correct about
+        # a real Noble machine.
+        run: |
+          for tool in cmake ctest cpack ccmake; do
+            path="$(command -v "${tool}" || true)"
+            if [[ -n "${path}" && "${path}" != "/usr/bin/${tool}" ]]; then
+              echo "removing ${path}, not from the Ubuntu archive"
+              sudo rm -f "${path}"
+            fi
+          done
+
+      - name: env_check reports a bare machine
+        # Nothing is installed yet, so this must exit 2. A 0 here would mean the
+        # check passes on a machine with no ROS on it.
+        run: |
+          status=0
+          ./env_check.sh --no-color || status=$?
+          [[ "${status}" -eq 2 ]] || { echo "expected exit 2, got ${status}"; exit 1; }
+
+      - name: install.sh
+        # The runner user has passwordless sudo, so the script runs unmodified.
+        run: ./install.sh --domain-id 7
+
+      - name: env_check after the install
+        # Sourced explicitly: a GitHub step is non-interactive and does not read
+        # ~/.bashrc on its own.
+        run: |
+          source "${HOME}/.bashrc"
+          ./env_check.sh --no-color
+
+      - name: Disk usage
+        if: always()
+        run: |
+          df -h / "${HOME}"
+          du -sh "${HOME}/ros2_ws" /opt/ros 2>/dev/null || true
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs
+          path: |
+            ~/.ros2-env/logs/
+            ~/.ros2-env/manifest-*.txt
+            ~/.ros2-env/workspace.repos.lock
+          if-no-files-found: warn
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      # ghcr.io has no anonymous push. GITHUB_TOKEN carries this per job, so
+      # there is no repository secret to configure.
+      packages: write
+
+    env:
+      # The only variable compose requires; every other value in .env.example
+      # defaults to something that suits a runner.
+      WS_HOST: ${{ github.workspace }}/ros2_ws_docker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        # ghcr.io rejects an uppercase path, and an owner login may have one.
+        run: |
+          owner="$(tr '[:upper:]' '[:lower:]' <<<"${{ github.repository_owner }}")"
+          echo "ROS2_IMAGE=ghcr.io/${owner}/ros2-env:jazzy" >>"${GITHUB_ENV}"
+          echo "DATED_IMAGE=ghcr.io/${owner}/ros2-env:jazzy-$(date -u +%Y%m%d)" >>"${GITHUB_ENV}"
+
+      - name: Build
+        working-directory: docker
+        run: docker compose build
+
+      - name: Check it from inside
+        # dev only: the sim service wants an X display, which no runner has.
+        working-directory: docker
+        run: |
+          mkdir -p "${WS_HOST}"
+          docker compose up -d dev
+          docker compose exec -T --user ros dev /opt/ros2-env/env_check.sh --no-color
+
+      - name: Container logs
+        if: failure()
+        working-directory: docker
+        run: docker compose logs --no-color
+
+      - name: Publish to ghcr.io
+        # Only once the check passed, and never from a pull request: a fork's
+        # token cannot write packages, and an unreviewed branch should not
+        # publish the image people pull.
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "${ROS2_IMAGE}" "${DATED_IMAGE}"
+          docker push "${ROS2_IMAGE}"
+          docker push "${DATED_IMAGE}"
+
+      - name: Clean up
+        if: always()
+        working-directory: docker
+        run: docker compose down --remove-orphans

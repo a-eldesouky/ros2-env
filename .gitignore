@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# transitional copies, never committed
+*.bak
+*.orig
+
+# run output, belongs on the student's machine only
+*.log
+install.log
+
+# per machine, never committed. .env.example is the committed one.
+docker/.env
+
+# colcon output, if anyone builds inside the repository by mistake
+build/
+install/
+log/
+
+# saved maps belong in your workspace, not in this repository
+*.pgm
+*.pgm.yaml
+
