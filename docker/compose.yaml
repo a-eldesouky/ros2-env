@@ -1,0 +1,102 @@
+# ROS 2 Jazzy containers: the simulation, and a shell to work in.
+#
+# Copy .env.example to .env and fill it in, then:
+#
+#   docker compose build      build the image
+#   docker compose up -d      start it
+#
+# Software rendering by default, which works anywhere. For an NVIDIA GPU, set
+# the three graphics variables in .env; nothing here changes.
+#
+# Work in it:
+#
+#   docker compose exec dev bash
+#
+# README.md in this directory explains why it is shaped this way.
+
+services:
+  # The simulation. No bind mount over its workspace: the upstream image was
+  # built with --symlink-install, so /ros2_ws/install links back into
+  # /ros2_ws/src, and mounting your code over that path breaks the launch
+  # files it ships.
+  sim:
+    image: &image ${ROS2_IMAGE:-ros2-env:jazzy}
+    build: &build
+      context: .
+      dockerfile: Dockerfile
+    container_name: ros2-sim
+    # runc unless .env says nvidia. This is the whole of the GPU switch:
+    # nvidia-container-toolkit registers the nvidia runtime when it is installed.
+    runtime: ${DOCKER_RUNTIME:-runc}
+    # Host networking means no DDS discovery configuration to teach or debug.
+    # Shared IPC keeps Gazebo topic throughput usable.
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    restart: "no"
+    environment: &env
+      # Host networking plus the default domain means every machine on the LAN
+      # shares one ROS graph and can drive the others' robots. Both lines are
+      # the wall. ROS_LOCALHOST_ONLY is deprecated since Iron and warns on
+      # every node start, so ROS_AUTOMATIC_DISCOVERY_RANGE is the right variable.
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      DISPLAY: ${DISPLAY:-:0}
+      QT_X11_NO_MITSHM: "1"
+      # Read by entrypoint.sh, which remaps the container user to match. Without
+      # them every file you create lands on the host owned by uid 1000.
+      HOST_UID: ${HOST_UID:-1000}
+      HOST_GID: ${HOST_GID:-1000}
+      # Husarion's launch files default robot_model from this, and an unset value
+      # fails their own choice check before anything starts.
+      ROBOT_MODEL: ${ROBOT_MODEL:-rosbot}
+      # Read by pins.env. Inside the container the workspace is the bind mount at
+      # /workspace, and $HOME depends on which user the exec came in as, so
+      # without this env_check reports the workspace missing on a working
+      # container.
+      ROS2_WS: /workspace
+      # Graphics, all three from .env. The defaults are software rendering,
+      # where Gazebo runs at roughly 5 to 15 fps on a room sized world: ugly,
+      # and usable. .env.example says what to set for an NVIDIA card.
+      LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE:-1}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # simulation.yaml, not simulation.launch.py: upstream uses a YAML frontend
+    # launch file. The ROS environment is sourced explicitly because a
+    # non-interactive shell does not read the image's startup files, and both
+    # overlays are sourced because the rosbot stack lives in the image's own
+    # workspace at /ros2_ws.
+    command: >
+      bash -lc "source /opt/ros/$${ROS_DISTRO}/setup.bash &&
+      source /ros2_ws/install/setup.bash &&
+      ros2 launch rosbot_gazebo simulation.yaml ${SIM_LAUNCH_ARGS:-}"
+
+  # Where you work. This one has your workspace mounted.
+  dev:
+    image: *image
+    build: *build
+    container_name: ros2-dev
+    runtime: ${DOCKER_RUNTIME:-runc}
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    restart: "no"
+    environment: *env
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Mounted at /workspace, NOT /ros2_ws: that is where the upstream image
+      # keeps its own built rosbot stack, and mounting over it hides every
+      # rosbot package. NOT ~/ros2_ws on the host either: the native install
+      # builds that directory with
+      # --symlink-install, and those absolute symlinks do not resolve inside the
+      # container. entrypoint.sh refuses to start if you point this at one.
+      - ${WS_HOST:?WS_HOST is unset. Copy .env.example to .env and fill it in.}:/workspace
+      # The repository itself, so env_check.sh runs in here from the same file
+      # the host uses rather than a second copy that drifts from it.
+      - ${REPO_DIR:-..}:/opt/ros2-env:ro
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
