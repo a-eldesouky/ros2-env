@@ -36,6 +36,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n env_check.sh
+          python3 -m py_compile patch_component_bridges.py
           bash -n pins.env
 
       - name: Strip the runner's non-archive toolchain
@@ -124,6 +125,43 @@ jobs:
           mkdir -p "${WS_HOST}"
           docker compose up -d dev
           docker compose exec -T --user ros dev /opt/ros2-env/env_check.sh --no-color
+
+      - name: Every sensor in the image has a bridge
+        # The native path patches this table and env_check asserts it; the image
+        # takes whatever Husarion published, and this is what notices the day
+        # that changes. See COMPONENT_BRIDGE_ALIASES in pins.env.
+        working-directory: docker
+        run: |
+          docker compose exec -T --user ros dev python3 - <<'PY'
+          import re
+          import sys
+
+          import yaml
+
+          share = "/ros2_ws/install"
+          config = f"{share}/rosbot_description/share/rosbot_description/config/rosbot/basic.yaml"
+          launch = (
+              f"{share}/husarion_components_description/share"
+              "/husarion_components_description/launch/gz_components.launch.py"
+          )
+
+          # rosbot, basic: what compose launches when nothing overrides it.
+          types = [c["type"] for c in yaml.safe_load(open(config))["components"]]
+          # custom components carry their own urdf and never reach this table.
+          types = [t for t in types if t != "custom"]
+
+          source = open(launch).read()
+          start = source.index("components_types_with_names = {")
+          keys = set(re.findall(r'"([^"]+)"\s*:', source[start:source.index("}", start)]))
+
+          missing = [t for t in types if t not in keys]
+          print("component types:", ", ".join(types))
+          if missing:
+              print("no bridge launched for:", ", ".join(missing))
+              print("the image will publish no /scan. pins.env explains why.")
+              sys.exit(1)
+          print("every component type resolves to a bridge")
+          PY
 
       - name: Container logs
         if: failure()

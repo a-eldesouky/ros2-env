@@ -117,11 +117,54 @@ is. Paste its whole output when you ask for help.
 `HOME=/root`, so the workspace and rosdep rows would be checked against paths
 nothing actually uses.
 
-Two rows read differently in here, and both are expected:
+Three rows read differently in here, and all three are expected:
 
 * `rosbot_ros` and `husarion_gz_worlds` say **from the image**. The container's
   Husarion sources come from the published image rather than a pinned checkout.
+* `component bridges` says **from the image** too, for the same reason. The
+  native path patches that file; this path takes whatever the image was built
+  with. The section below says what that means.
 * the workspace is `/workspace`, not `~/ros2_ws`.
+
+## The lidar in here is not the lidar on the native path
+
+Both paths launch the same `robot_model:=rosbot`, and they publish different
+scans:
+
+| | native | this image |
+|---|---|---|
+| component type in `basic.yaml` | `rplidar_c1` | `LDR02`, which resolves to `rplidar_s2` |
+| beams per scan | 500 | 3000 |
+| `range_max` | 12.0 m | 30.0 m |
+
+Measured on both, September 2026. Anything that depends on those numbers will
+not match between the two paths: costmap inflation, a SLAM maximum range, an
+exercise that counts returns. `slam_toolbox`'s stock 20 m maximum is beyond the
+native C1 and short of this image's S2, and it warns about the first.
+
+The difference is a matter of dates. On 26 August 2026 upstream renamed the
+component types in `rosbot_ros`, which the native path picks up because it
+tracks a branch. `husarion/rosbot-gazebo:jazzy` was last published on 5 August
+and still carries the old names, so this image sits on the far side of that
+change. `pins.env` explains the rename in full, above
+`COMPONENT_BRIDGE_ALIASES`.
+
+That also means this path does not need the repair the native one does, and is
+not given it. The day Husarion republish the tag, a `docker compose build` will
+pull the renamed configs and `/scan` will disappear from the container the way
+it does on an unpatched native install: `gz topic -l` lists it, `ros2 topic
+list` does not, SLAM waits for a scan that never arrives, and Nav2 then reports
+`Timed out waiting for transform from base_link to map`.
+
+CI watches for it. The docker job reads the component types out of the image's
+own `basic.yaml` and fails if any of them is missing from the bridge table, so
+a republished base image turns the build red rather than reaching anyone.
+
+If it does happen, the fix is to give this image the same treatment
+`install.sh` gives the native workspace: run `patch_component_bridges.py` from
+the repository root against
+`/ros2_ws/src/husarion_components_description/launch/gz_components.launch.py`
+inside the image, at build time.
 
 ## Working in it
 

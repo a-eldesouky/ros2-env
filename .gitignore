@@ -21,3 +21,7 @@ log/
 *.pgm
 *.pgm.yaml
 
+
+# py_compile, run by CI and by anyone testing the patch script by hand.
+__pycache__/
+*.pyc

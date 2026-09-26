@@ -41,6 +41,7 @@ readonly STATE_DIR="${HOME}/.ros2-env"
 readonly LOG_DIR="${STATE_DIR}/logs"
 readonly REPOS_LOCK="${STATE_DIR}/workspace.repos.lock"
 readonly ENV_CHECK="${SCRIPT_DIR}/env_check.sh"
+readonly BRIDGE_PATCH="${SCRIPT_DIR}/patch_component_bridges.py"
 readonly MARKER="# >>> ros2-env, ROS 2 jazzy >>>"
 readonly MARKER_END="# <<< ros2-env, ROS 2 jazzy <<<"
 # Written by older versions of this script. Removed on every run, so a rename
@@ -51,6 +52,9 @@ readonly LEGACY_MARKER_END="# <<< robotics course, ROS 2 jazzy <<<"
 ROS_DOMAIN_ID_VALUE="${ROS2_DOMAIN_ID:-0}"
 LOG_FILE=""
 CURRENT_STEP="startup"
+# Set when the component bridge patch cannot be applied. Checked at the end,
+# where --skip-verify cannot hide it.
+BRIDGE_PATCH_FAILED=0
 
 # ---------------------------------------------------------------- output
 
@@ -378,6 +382,50 @@ apply_exclusions() {
   done
 }
 
+# Repairs the component bridge table upstream left behind when they renamed the
+# component types. Without it the simulation starts clean and publishes no
+# /scan, which then fails SLAM and Nav2. The whole explanation, and the table
+# itself, are in pins.env above COMPONENT_BRIDGE_ALIASES.
+#
+# Applied to the vcs import checkout, not to rosbot_ros: that one is pulled
+# --ff-only on every run, and a patched file there would turn every later run
+# into a refused fast forward. husarion_components_description arrives through
+# vcs import --skip-existing, which never touches it again.
+patch_component_bridges() {
+  local target="${WORKSPACE}/src/husarion_components_description/launch/gz_components.launch.py"
+  # Defaulted, so an older pins.env without the table is a skip rather than an
+  # unbound variable under set -u.
+  local aliases="${COMPONENT_BRIDGE_ALIASES:-}"
+
+  if [[ -z "${aliases// /}" ]]; then
+    info "COMPONENT_BRIDGE_ALIASES is empty, leaving upstream's bridge table alone"
+    return 0
+  fi
+  if [[ ! -f "${BRIDGE_PATCH}" ]]; then
+    warn "patch_component_bridges.py not found next to install.sh"
+    warn "the simulation will build and run, but /scan will have no publisher"
+    return 0
+  fi
+  if [[ ! -f "${target}" ]]; then
+    warn "gz_components.launch.py not found, skipping the component bridge patch"
+    warn "expected ${target}"
+    return 0
+  fi
+
+  local status=0
+  python3 "${BRIDGE_PATCH}" "${target}" "${aliases}" || status=$?
+  case "${status}" in
+    0) ok "component bridges patched, /scan and /oak/* will reach ROS 2" ;;
+    2) ok "component bridges already patched" ;;
+    3) ok "component bridges need no patch, upstream carries the names now" ;;
+    *)
+      BRIDGE_PATCH_FAILED=1
+      warn "could not patch gz_components.launch.py, it is not shaped as expected"
+      warn "the workspace will build, and the simulation will publish no /scan"
+      ;;
+  esac
+}
+
 install_sources() {
   banner "Workspace sources"
   mkdir -p "${WORKSPACE}/src"
@@ -701,6 +749,10 @@ main() {
   install_ros
   install_sources
   install_deps
+  # After the import that puts the file there, before the build that installs
+  # it. Called from here rather than from install_deps, because that one runs
+  # in a subshell and nothing it sets would reach the check at the end.
+  patch_component_bridges
   build_workspace
   setup_bashrc
   write_manifest
@@ -709,6 +761,16 @@ main() {
     banner "Skipping verification as requested"
   elif ! verify; then
     printf '\n%s\n' "Everything installed, but the checks above did not all pass."
+    [[ -n "${LOG_FILE}" ]] && printf '%s\n' "Send ${LOG_FILE} to a bug report."
+    exit 1
+  fi
+
+  # Outside the block above on purpose. A workspace with no /scan is a broken
+  # environment, and --skip-verify is not a reason to call it finished.
+  if (( BRIDGE_PATCH_FAILED )); then
+    printf '\n%s\n' "Everything installed, but the component bridge patch did not apply,"
+    printf '%s\n' "so the simulation will publish no /scan. See COMPONENT_BRIDGE_ALIASES"
+    printf '%s\n' "in pins.env, which says what changed upstream and what to do about it."
     [[ -n "${LOG_FILE}" ]] && printf '%s\n' "Send ${LOG_FILE} to a bug report."
     exit 1
   fi

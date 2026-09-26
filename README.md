@@ -213,6 +213,10 @@ Never with `sudo`. A root-owned `build/` is a bad afternoon.
 
 * Do not edit anything in `src/rosbot_ros` or `src/husarion_gz_worlds`. They are
   upstream checkouts the installer manages, and a later run updates them.
+* One upstream file is an exception, and the installer owns it rather than you:
+  `src/husarion_components_description/launch/gz_components.launch.py` carries a
+  patch without which nothing publishes `/scan`. Every run re-applies it. See
+  [Sensor bridges](#sensor-bridges).
 * Do not commit `build/`, `install/` or `log/`.
 * Do not run `colcon` with `sudo`.
 
@@ -268,6 +272,63 @@ ros2 topic pub /cmd_vel geometry_msgs/msg/TwistStamped \
 The simulation publishes more than this: `/odometry/wheels` is wheel-only
 odometry from before the EKF, `/oak/*` is the depth camera, and `/set_pose`
 resets the EKF.
+
+### Sensor bridges
+
+`/scan` and `/oak/*` reach ROS 2 only because `install.sh` repairs an upstream
+file after cloning it. Without that repair the simulation comes up looking
+normal, `gz topic -l` lists `/scan`, and `ros2 topic list` does not.
+
+Husarion name each sensor with one `type:` string in
+`rosbot_description/config/rosbot/basic.yaml`. Two files in
+`husarion_components_description` read that string and do not share a table:
+`urdf/components.urdf.xacro` builds the sensor into Gazebo, and
+`launch/gz_components.launch.py` starts the `ros_gz_bridge` that carries it
+into ROS 2. On 26 August 2026 upstream renamed the strings, so that `LDR02`
+became `rplidar_c1` and `CAM11` became `oak_d_lite`, and taught only the first
+of the two. The lookup in the second is guarded by `if component_type in ...`,
+so an unrecognised name starts no bridge and logs nothing.
+
+The `humble` branch still uses the old codes, which is why Husarion's own
+tutorial and their prebuilt images do not show this and the `jazzy` branch
+does.
+
+The repair adds the current names to that table. It goes into the `vcs import`
+checkout rather than into `rosbot_ros`, which is pulled `--ff-only` on every
+run and would refuse to fast forward over a local edit. Running it twice
+changes nothing the second time, and it writes nothing at all once the table
+already knows the names. That last part only helps a fresh install, though:
+`vcs import --skip-existing` never updates a package it already has, so a
+machine that has the patch keeps it even after upstream fix their table. To
+pick up their fix, delete `src/husarion_components_description` and run
+`./install.sh` again.
+
+The table lives in `pins.env` under `COMPONENT_BRIDGE_ALIASES`, with the full
+account of the bug above it.
+
+On a patched workspace the bridge starts with the simulation and there is no
+second command to run: `simulation.yaml` includes `spawn_robot.yaml`, which
+includes `gz_components.launch.py`, which reads the table. You can see it in
+`ros2 node list` as `rplidar_c1_gz_bridge`, with `oak_oak_d_lite_gz_bridge`
+beside it for the camera.
+
+`./env_check.sh` reports it as `component bridges`. If that line says
+`not patched, no /scan`, the simulation will run and SLAM will sit waiting for
+a `LaserScan` that never arrives.
+
+The Docker path needs none of this, because its base image was published before
+the rename. That also means it simulates a different lidar from this one: 3000
+beams and 30 m against 500 beams and 12 m. If you use both paths, read
+[the lidar section](docker/README.md#the-lidar-in-here-is-not-the-lidar-on-the-native-path)
+in `docker/README.md` before comparing any numbers between them.
+
+To do it by hand, on a workspace you would rather not touch, launch the bridge
+upstream skipped, with the simulation already running:
+
+```bash
+ros2 launch husarion_components_description gz_slamtec_rplidar.launch.py \
+  gz_bridge_name:=rplidar_gz_bridge
+```
 
 ## SLAM and navigation
 
@@ -339,6 +400,36 @@ interruptions. If it fails in the same place twice, the log is at
 | Preflight lists unreachable hosts, then apt or git fails | Proxy or captive portal. Fix the network and run again. This is the most common real failure |
 | apt fails on `packages.ros.org` only | That mirror is mid-sync. Wait an hour |
 
+### `/scan` looks missing and is not
+
+Two readings say "no scan" on a working simulation, and both are worth ruling
+out before you go looking for a fault.
+
+`ros2 topic hz /scan` answers `topic [/scan] does not appear to be published
+yet`, then starts printing about 10 Hz a second later. Upstream marks these
+bridges `lazy: true`, so the bridge subscribes to Gazebo only once something
+subscribes on the ROS side. `hz` is that something. Until then the topic has a
+publisher and no traffic.
+
+`ros2 topic list` comes back short, or without `/scan`, shortly after a
+`ros2 daemon stop` or a burst of node restarts. That is the CLI daemon's cache,
+not the graph. One shell here printed three topics and `average rate: 10.789`
+within a few seconds of each other.
+
+`ros2 topic info /scan` settles both. It reads the graph directly, and
+`Publisher count: 1` means the bridge is up whatever the other two say.
+
+### The simulation runs but there is no `/scan`
+
+`gz topic -l | grep scan` lists it, `ros2 topic list` does not, SLAM waits
+forever and Nav2 then reports `Timed out waiting for transform from base_link
+to map`. That is the upstream bridge table, and `./env_check.sh` says so on its
+`component bridges` line. Re-run `./install.sh`, which re-applies the patch, or
+read [Sensor bridges](#sensor-bridges) for the one-command workaround.
+
+Nav2's transform timeout is a symptom here, not a second problem: no
+`LaserScan` means no map, which means no `map -> base_link`.
+
 ### Warnings that are not errors
 
 | Warning | What it costs you |
@@ -385,7 +476,11 @@ every install records what it actually received:
 
 Those two files are what make a broken machine comparable to a working one, and
 `vcs import src < workspace.repos.lock` is how you put a machine back on a
-configuration that worked. CI runs the whole install weekly for the same reason:
+configuration that worked. Follow it with `./install.sh`: the lock records the
+commit each repository was on, and `install.sh` patches one file in
+`husarion_components_description` after cloning it, so a workspace restored
+from the lock alone builds and runs and publishes no `/scan`. See
+[Sensor bridges](#sensor-bridges). CI runs the whole install weekly for the same reason:
 an upstream break should be a red build rather than a room full of people.
 
 `pins.env` is the one place expected versions live, read by both scripts so they
@@ -395,9 +490,10 @@ against edited pins has proved nothing.
 ## Layout
 
 ```
-install.sh          the installer
-env_check.sh        the environment check
-pins.env            the expected versions, read by both scripts
+install.sh                    the installer
+env_check.sh                  the environment check
+pins.env                      the expected versions, read by both scripts
+patch_component_bridges.py    one upstream repair, applied during install
 docker/             the container path, Linux hosts only
 .github/workflows/  CI: a full install on a clean Ubuntu 24.04 runner
 ```
