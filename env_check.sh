@@ -389,6 +389,45 @@ check_workspace() {
     row "${repo}" "${sha_found:-present, not a git checkout}" "recorded, not pinned" "PASS"
   done
 
+  # Whether the component bridge table has the names this environment's configs
+  # actually use. Unpatched, the simulation starts clean and nothing publishes
+  # /scan, which fails SLAM and then Nav2. COMPONENT_BRIDGE_ALIASES in pins.env
+  # explains why upstream ships it that way, and install.sh is what repairs it.
+  local bridge_launch table entry name present=0 total=0
+  bridge_launch="${EXPECT_HUSARION_SRC}/husarion_components_description/launch/gz_components.launch.py"
+  if [[ "${INSTALL_PATH}" == "docker" ]]; then
+    row "component bridges" "from the image" "not patched by this repository" "WARN"
+  elif [[ -z "${COMPONENT_BRIDGE_ALIASES:-}" ]]; then
+    row "component bridges" "no aliases configured" "COMPONENT_BRIDGE_ALIASES in pins.env" "WARN"
+  elif [[ ! -f "${bridge_launch}" ]]; then
+    row "component bridges" "launch file not found" "${bridge_launch}" "MISSING"
+  elif grep -q 'ros2-env: canonical component names' "${bridge_launch}" 2>/dev/null; then
+    row "component bridges" "patched by install.sh" "sensors reach ROS 2" "PASS"
+  else
+    # Counted rather than sampled, so a table upstream has half fixed reads as
+    # half fixed instead of as either state.
+    #
+    # One pass over the file, and the colon keeps a name upstream uses as a
+    # value ("ANT02": "teltonika") from counting as a key.
+    table="$(grep -oE '"[A-Za-z0-9_]+":' "${bridge_launch}" 2>/dev/null | tr -d '":' | sort -u)"
+    # The list is deliberately unquoted below, for the word splitting. Globbing
+    # is off around it so that a name with a * in it cannot match the directory.
+    set -f
+    for entry in ${COMPONENT_BRIDGE_ALIASES}; do
+      name="${entry%%:*}"
+      total=$((total + 1))
+      [[ $'\n'"${table}"$'\n' == *$'\n'"${name}"$'\n'* ]] && present=$((present + 1))
+    done
+    set +f
+    if (( total > 0 && present == total )); then
+      row "component bridges" "upstream carries the names" "sensors reach ROS 2" "PASS"
+    elif (( present > 0 )); then
+      row "component bridges" "${present} of ${total} names present" "all of them" "FAIL"
+    else
+      row "component bridges" "not patched, no /scan" "sensors reach ROS 2" "FAIL"
+    fi
+  fi
+
   # Sourcing the overlay is what proves the build produced something usable,
   # which a directory listing does not. On the Docker path the rosbot stack comes
   # from the image overlay, sourced earlier, and not from the bind mount.
